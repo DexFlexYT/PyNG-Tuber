@@ -1,0 +1,1 @@
+python 3.11 required, dont forget to change the path in start.bat to your python 3.11 path, and if shit doesnt work which i guarantee you it wont, ask chat GPT for help, the code works fine, you just need to do a lot if PIP fuckery to get everything to be compatible
