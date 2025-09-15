@@ -17,10 +17,13 @@ RIGHT_EYE_IDX = 263
 DEFAULT_TOLERANCE = 0.06
 
 # runtime thresholds (can be reloaded from settings.json via 'l')
-SWITCH_THRESHOLD = 0.005        # time (s) required for lower-confidence emotion to be stable
-SPEAK_SWITCH_THRESHOLD = 0.0    # speak debounce (s)
-VOLUME_THRESHOLD = 5e-7         # mic sensitivity
+SWITCH_THRESHOLD = 0.005  
 INSTANT_CONFIDENCE = 0.85      # if score >= this, switch instantly
+
+SPEAK_SWITCH_THRESHOLD = 0.0    # speak debounce (s)
+VOLUME_THRESHOLD_START = 5e-7   # low -> easy to trigger start
+VOLUME_THRESHOLD_STOP  = 2e-6   # high -> need stronger silence to stop
+
 
 # textures dir and map
 character_textures_dir = "textures/dex"
@@ -53,16 +56,17 @@ def load_textures():
     return loaded
 
 def load_settings(cfg_path="settings.json"):
-    global SWITCH_THRESHOLD, SPEAK_SWITCH_THRESHOLD, VOLUME_THRESHOLD, INSTANT_CONFIDENCE
+    global SWITCH_THRESHOLD, SPEAK_SWITCH_THRESHOLD, VOLUME_THRESHOLD_START, VOLUME_THRESHOLD_STOP, INSTANT_CONFIDENCE
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r") as f:
                 cfg = json.load(f)
             SWITCH_THRESHOLD = float(cfg.get("switch_threshold", SWITCH_THRESHOLD))
             SPEAK_SWITCH_THRESHOLD = float(cfg.get("speak_switch_threshold", SPEAK_SWITCH_THRESHOLD))
-            VOLUME_THRESHOLD = float(cfg.get("volume_threshold", VOLUME_THRESHOLD))
+            VOLUME_THRESHOLD_START = float(cfg.get("volume_threshold_start", VOLUME_THRESHOLD_START))
+            VOLUME_THRESHOLD_STOP = float(cfg.get("volume_threshold_stop", VOLUME_THRESHOLD_STOP))
             INSTANT_CONFIDENCE = float(cfg.get("instant_confidence", INSTANT_CONFIDENCE))
-            print(f"[load_settings] switch={SWITCH_THRESHOLD}, speak_switch={SPEAK_SWITCH_THRESHOLD}, volume={VOLUME_THRESHOLD}, instant_conf={INSTANT_CONFIDENCE}")
+            print(f"[load_settings] switch={SWITCH_THRESHOLD}, speak_switch={SPEAK_SWITCH_THRESHOLD}, volume_threshold_start={VOLUME_THRESHOLD_START}, volume_threshold_stop={VOLUME_THRESHOLD_STOP}, instant_conf={INSTANT_CONFIDENCE}")
         except Exception as e:
             print("[load_settings] failed:", e)
     else:
@@ -126,12 +130,19 @@ def orthogonal_procrustes_mae(X, Y):
 
 # ----------------- audio (simple VAD) -----------------
 speaking = False
+
 def audio_callback(indata, frames, time_, status):
     global speaking
-    # use RMS-ish measure normalized by frames; tune VOLUME_THRESHOLD in settings
     volume_norm = np.linalg.norm(indata) / frames
-    speaking = volume_norm > VOLUME_THRESHOLD
 
+    if speaking:
+        # already talking -> require stronger silence to stop
+        if volume_norm < VOLUME_THRESHOLD_STOP:
+            speaking = False
+    else:
+        # currently silent -> easier to trigger speech
+        if volume_norm > VOLUME_THRESHOLD_START:
+            speaking = True
 # start audio stream
 stream = sd.InputStream(callback=audio_callback)
 stream.start()
