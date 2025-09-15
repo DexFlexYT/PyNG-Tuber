@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import os, json, time
 from PIL import Image
+import sounddevice as sd
 
 TEMPLATES_DIR = "templates"
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
@@ -13,26 +14,70 @@ mp_drawing = mp.solutions.drawing_utils
 LEFT_EYE_IDX = 33
 RIGHT_EYE_IDX = 263
 DEFAULT_TOLERANCE = 0.06
-SWITCH_THRESHOLD = 0.15
+SWITCH_THRESHOLD = 0.025  # emotion switching delay
+SPEAK_SWITCH_THRESHOLD = 0.0005  # speaking switching delay
+
+# audio input setup
+VOLUME_THRESHOLD = 0.00015  # adjust to sensitivity
+speaking = False
+speaking_state = False
+speaking_since = None
+
+character_textures_dir = "textures/dex"
 
 textures = {
-    "neutral": "textures/placeholders/neutral.png",
-    "happy": "textures/placeholders/happy.png",
-    "angry": "textures/placeholders/angry.png",
-    "surprised": "textures/placeholders/surprise.png",
-    "mewing": "textures/placeholders/mewing.png",
-    "1": "textures/placeholders/disgust.png",
-    "2": "textures/placeholders/mewing.png"
+    "neutral": {
+        "main": f"{character_textures_dir}/neutral.png",
+        "speaking": f"{character_textures_dir}/neutral_speaking.png"
+    },
+    "happy": {
+        "main": f"{character_textures_dir}/happy.png",
+        "speaking": f"{character_textures_dir}/happy_speaking.png"
+    },
+    "angry": {
+        "main": f"{character_textures_dir}/angry.png",
+        "speaking": f"{character_textures_dir}/angry_speaking.png"
+    },
+    "surprised": {
+        "main": f"{character_textures_dir}/surprise.png",
+        "speaking": f"{character_textures_dir}/surprise_speaking.png"
+    },
+    "mewing": {
+        "main": f"{character_textures_dir}/mewing.png",
+        "speaking": f"{character_textures_dir}/mewing_speaking.png"
+    },
+    "peculiar": {
+        "main": f"{character_textures_dir}/peculiar.png",
+        "speaking": f"{character_textures_dir}/peculiar_speaking.png"
+    }
 }
 
 # load images with alpha channel
-loaded_textures = {k: cv2.cvtColor(np.array(Image.open(v).convert('RGBA')), cv2.COLOR_RGBA2BGRA) for k,v in textures.items()}
+loaded_textures = {}
+for emotion, tex in textures.items():
+    loaded_textures[emotion] = {}
+    for state, path in tex.items():
+        if os.path.exists(path):
+            loaded_textures[emotion][state] = cv2.cvtColor(
+                np.array(Image.open(path).convert("RGBA")),
+                cv2.COLOR_RGBA2BGRA
+            )
 
 WINDOW_WIDTH, WINDOW_HEIGHT = 640, 480
 GREEN_KEY = (0, 255, 0, 255)
 
 cv2.namedWindow("PNG Tuber", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("PNG Tuber", WINDOW_WIDTH, WINDOW_HEIGHT)
+
+def audio_callback(indata, frames, time_, status):
+    global speaking
+    volume_norm = np.linalg.norm(indata) / frames
+    speaking = volume_norm > VOLUME_THRESHOLD
+
+stream = sd.InputStream(callback=audio_callback)
+stream.start()
+
+# === utility functions remain unchanged ===
 
 def get_landmark_array(landmarks):
     return np.array([[lm.x, lm.y] for lm in landmarks], dtype=np.float32)
@@ -86,12 +131,16 @@ def orthogonal_procrustes_mae(X, Y):
     Xr = Xa @ R
     return float(np.mean(np.abs(Xr - Ya)))
 
+# === main loop ===
+
 cap = cv2.VideoCapture(0)
 templates = load_templates()
 print("Loaded templates:", list(templates.keys()))
 
 recording = False
 record_samples = []
+record_interval = 0.0
+last_record_time = 0.0
 candidate_name = None
 candidate_since = None
 displayed_emotion = None
@@ -126,6 +175,7 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
             mp_drawing.draw_landmarks(frame, results.multi_face_landmarks[0], mp_face_mesh.FACEMESH_TESSELATION, mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1), mp_drawing.DrawingSpec(color=(0,128,255), thickness=1))
 
         now = time.monotonic()
+        # emotion switching with SWITCH_THRESHOLD
         if match_name != candidate_name:
             candidate_name = match_name
             candidate_since = now
@@ -135,52 +185,71 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
             elif candidate_name is None and displayed_emotion is not None and (now - candidate_since) >= SWITCH_THRESHOLD:
                 displayed_emotion = None
 
-        # Overlay info on webcam preview
+        # speaking switching with SPEAK_SWITCH_THRESHOLD
+        if speaking != speaking_state:
+            if speaking_since is None:
+                speaking_since = now
+            elif (now - speaking_since) >= SPEAK_SWITCH_THRESHOLD:
+                speaking_state = speaking
+                speaking_since = None
+        else:
+            speaking_since = None
+
+        # Overlay info
         y = 20
         cv2.putText(frame, f"Templates: {', '.join(templates.keys()) or 'none'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200),1); y+=22
         cv2.putText(frame, f"REC: {'ON' if recording else 'OFF'} (press 'r')", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0) if recording else (0,180,255),2); y+=26
         if match_name: cv2.putText(frame, f"Instant match -> {match_name} mae={match_mae:.4f} score={match_score*100:.0f}%", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2); y+=26
         else: cv2.putText(frame, "Instant match -> none", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2); y+=26
-        cv2.putText(frame, f"Displayed (stable >= {int(SWITCH_THRESHOLD*1000)}ms): {displayed_emotion or 'none'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2); y+=26
-        if recording: cv2.putText(frame, f"Recording samples: {len(record_samples)} (press 'r')", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+        cv2.putText(frame, f"Displayed emotion: {displayed_emotion or 'none'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2); y+=26
+        cv2.putText(frame, f"Speaking: {'YES' if speaking_state else 'no'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255) if speaking_state else (180,180,180),2); y+=26
+        if recording:
+            cv2.putText(frame, f"Recording samples: {len(record_samples)} (press 'r')", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
         cv2.imshow("Template Recorder Matcher (Smoothed)", frame)
 
         # PNG tuber window
+                # PNG tuber window
         tuber_frame = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH,4), dtype=np.uint8)
         tuber_frame[:,:] = GREEN_KEY
-        texture = loaded_textures.get(displayed_emotion or 'neutral')
-        # Fix for broadcasting error when overlaying texture on PNG tuber frame
-        # The issue happens because y and x may exceed window bounds or the texture is larger than the window
 
-        # inside the main loop, replace the previous alpha blending block with this:
+        emotion = displayed_emotion or "neutral"
+        state = "speaking" if speaking_state and emotion in loaded_textures and "speaking" in loaded_textures[emotion] else "main"
+        texture = loaded_textures.get(emotion, {}).get(state)
+
         if texture is not None:
+            # Resize texture to fit the window while preserving aspect ratio
             th, tw = texture.shape[:2]
-            x = max((WINDOW_WIDTH - tw) // 2, 0)
-            y = max((WINDOW_HEIGHT - th) // 2, 0)
+            scale = min(WINDOW_WIDTH / tw, WINDOW_HEIGHT / th)
+            new_w, new_h = int(tw * scale), int(th * scale)
+            resized = cv2.resize(texture, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-            # calculate slice limits to avoid going out of bounds
-            y1, y2 = y, min(y + th, WINDOW_HEIGHT)
-            x1, x2 = x, min(x + tw, WINDOW_WIDTH)
+            # Center the resized texture
+            x = (WINDOW_WIDTH - new_w) // 2
+            y = (WINDOW_HEIGHT - new_h) // 2
 
-            # calculate corresponding texture slice
-            tex_y1, tex_y2 = 0, y2 - y1
-            tex_x1, tex_x2 = 0, x2 - x1
+            y1, y2 = y, y + new_h
+            x1, x2 = x, x + new_w
 
-            alpha_s = texture[tex_y1:tex_y2, tex_x1:tex_x2, 3:4] / 255.0
+            alpha_s = resized[:, :, 3:4] / 255.0
             alpha_l = 1.0 - alpha_s
 
-            # blend BGR channels
-            tuber_frame[y1:y2, x1:x2, :3] = alpha_s * texture[tex_y1:tex_y2, tex_x1:tex_x2, :3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3]
+            tuber_frame[y1:y2, x1:x2, :3] = alpha_s * resized[:, :, :3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3]
 
         cv2.imshow("PNG Tuber", tuber_frame)
-        
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): break
         if key == ord('r'):
             recording = not recording
             if recording:
                 record_samples = []
-                print("[record] started. Press 'r' to stop.")
+                interval_input = input("Recording interval in seconds (e.g. 0.5): ").strip()
+                try:
+                    record_interval = float(interval_input)
+                except:
+                    record_interval = 0.0
+                last_record_time = 0.0
+                print(f"[record] started with interval {record_interval}s. Press 'r' to stop.")
             else:
                 if not record_samples:
                     print("[record] stopped but no samples recorded.")
@@ -207,7 +276,10 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
                         templates = load_templates()
                 record_samples = []
         if recording and live_vector is not None:
-            record_samples.append(live_vector.tolist())
+            if (now - last_record_time) >= record_interval:
+                record_samples.append(live_vector.tolist())
+                last_record_time = now
 
 cap.release()
 cv2.destroyAllWindows()
+stream.stop()
