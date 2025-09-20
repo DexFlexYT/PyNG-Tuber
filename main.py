@@ -25,11 +25,21 @@ RIGHT_IRIS = [474, 475, 476, 477, 478]
 # eye corner indices for normalization (left / right)
 LEFT_EYE_CORNERS = (33, 133)   # left eye: outer, inner
 RIGHT_EYE_CORNERS = (362, 263) # right eye: inner, outer
-
+# eye indices for eye openness and such
 LEFT_EYE_IDX = 33
 RIGHT_EYE_IDX = 263
+LEFT_EYE_UPPER = 159
+LEFT_EYE_LOWER = 145
+RIGHT_EYE_UPPER = 386
+RIGHT_EYE_LOWER = 374
+# Eyebrow indices
+LEFT_BROW = [70, 63, 105] # left inner/mid/out brow
+RIGHT_BROW = [336, 296, 334] # right inner/mid/out brow
+
 NOSE_IDX = 1
 CHIN_IDX = 152  # approximate chin tip in MediaPipe Face Mesh
+
+tneutral_brow = None
 
 DEFAULT_TOLERANCE = 0.06
 
@@ -130,6 +140,74 @@ stream.start()
 def get_eye_center(pts, indices):
     selected = pts[indices]
     return np.mean(selected, axis=0)
+
+def compute_brow_value(pts3):
+    global tneutral_brow
+    try:
+        left_eye_mid = (pts3[LEFT_EYE_CORNERS[0]] + pts3[LEFT_EYE_CORNERS[1]])/2.0
+        right_eye_mid = (pts3[RIGHT_EYE_CORNERS[0]] + pts3[RIGHT_EYE_CORNERS[1]])/2.0
+
+        left_brow_mid = np.mean(pts3[LEFT_BROW], axis=0)
+        right_brow_mid = np.mean(pts3[RIGHT_BROW], axis=0)
+
+        # vertical distances
+        left_dist = left_brow_mid[1] - left_eye_mid[1]
+        right_dist = right_brow_mid[1] - right_eye_mid[1]
+        avg_dist = (left_dist + right_dist)/2.0
+
+        # normalize by average eye width
+        left_w = np.linalg.norm(pts3[LEFT_EYE_CORNERS[0]][:2] - pts3[LEFT_EYE_CORNERS[1]][:2])
+        right_w = np.linalg.norm(pts3[RIGHT_EYE_CORNERS[0]][:2] - pts3[RIGHT_EYE_CORNERS[1]][:2])
+        ref_w = (left_w + right_w) / 2.0 + 1e-8
+
+        avg_dist_norm = avg_dist / ref_w
+
+        # initialize neutral reference
+        if tneutral_brow is None:
+            tneutral_brow = avg_dist_norm
+
+        delta = avg_dist_norm - tneutral_brow
+        return float(delta)
+    except Exception:
+        return 0.0
+
+
+def compute_eye_openness(pts3):
+    """Return a normalized eye openness value in [0,1].
+    We compute normalized vertical separation between upper and lower eyelid and divide by eye width (to be scale invariant).
+    """
+    try:
+        lu = pts3[LEFT_EYE_UPPER][:2]
+        ll = pts3[LEFT_EYE_LOWER][:2]
+        ru = pts3[RIGHT_EYE_UPPER][:2]
+        rl = pts3[RIGHT_EYE_LOWER][:2]
+        # eye widths for normalization
+        left_outer = pts3[LEFT_EYE_CORNERS[0]][:2]
+        left_inner = pts3[LEFT_EYE_CORNERS[1]][:2]
+        right_inner = pts3[RIGHT_EYE_CORNERS[0]][:2]
+        right_outer = pts3[RIGHT_EYE_CORNERS[1]][:2]
+    except Exception:
+        return 1.0
+
+    left_vert = abs(lu[1] - ll[1])
+    left_w = np.linalg.norm(left_outer - left_inner)
+    right_vert = abs(ru[1] - rl[1])
+    right_w = np.linalg.norm(right_outer - right_inner)
+
+    # avoid divide by zero
+    left_norm = left_vert / (left_w + 1e-8)
+    right_norm = right_vert / (right_w + 1e-8)
+
+
+    val = float((left_norm + right_norm) / 2.0)
+
+    # normalization: you may want to tune these values depending on camera distance / model
+    # here we assume typical open eye value ~0.03..0.08; map that to [0,1]
+    MIN_OV = 0.012
+    MAX_OV = 0.08
+    t = (val - MIN_OV) / (MAX_OV - MIN_OV)
+    t = max(0.0, min(1.0, t))
+    return t
 
 
 def compute_pupil_normalized(pts3):
@@ -312,54 +390,70 @@ speaking_since = None
 
 
 # ----------------- main loop -----------------
-with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5) as face_mesh:
+with mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+) as face_mesh:
     try:
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
+
             h, w = frame.shape[:2]
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = face_mesh.process(img_rgb)
 
+            # runtime variables
             live_vector = None
             match_name = None
             match_mae = None
             match_score = None
-            head_rot = {'pitch':0.0,'yaw':0.0,'roll':0.0}
-            pupil = {'x':0.0,'y':0.0}
+            head_rot = {'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0}
+            pupil = {'x': 0.0, 'y': 0.0}
 
             if results.multi_face_landmarks:
                 lm = results.multi_face_landmarks[0].landmark
                 pts3 = get_landmark_array(lm)
 
-                # pupil / iris tracking (normalized face-local coordinates)
+                # pupil / iris tracking
                 pupil = compute_pupil_normalized(pts3)
 
                 vec = normalize_landmarks_no_rotate(pts3)
                 if vec is not None:
                     live_vector = np.array(vec, dtype=np.float32)
-                    live_pts = live_vector.reshape(-1,2)
+                    live_pts = live_vector.reshape(-1, 2)
+
                     best = None
                     for tname, t in templates.items():
                         for samp in t['samples']:
-                            samp_pts = samp.reshape(-1,2)
+                            samp_pts = samp.reshape(-1, 2)
                             mae = orthogonal_procrustes_mae(live_pts, samp_pts)
                             if best is None or mae < best[1]:
                                 best = (tname, mae, t.get('tolerance', DEFAULT_TOLERANCE))
+
                     if best is not None:
                         bname, bmae, btol = best
-                        score = max(0.0, 1.0 - (bmae / btol)) if btol>0 else 0.0
+                        score = max(0.0, 1.0 - (bmae / btol)) if btol > 0 else 0.0
                         match_name, match_mae, match_score = bname, bmae, score
 
-                # compute head rotation heuristic
+                # compute head rotation
                 head_rot = compute_head_rotation(pts3)
-                mp_drawing.draw_landmarks(frame, results.multi_face_landmarks[0], mp_face_mesh.FACEMESH_TESSELATION,
-                                          mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1),
-                                          mp_drawing.DrawingSpec(color=(0,128,255), thickness=1))
+
+                if not DATA_STREAMING_MODE:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        results.multi_face_landmarks[0],
+                        mp_face_mesh.FACEMESH_TESSELATION,
+                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1, circle_radius=1),
+                        mp_drawing.DrawingSpec(color=(0, 128, 255), thickness=1)
+                    )
 
             now = time.monotonic()
 
-            # improved emotion switching
+            # emotion switching
             if match_name != candidate_name:
                 candidate_name = match_name
                 candidate_since = now
@@ -375,7 +469,7 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
                     if displayed_emotion is not None and (now - candidate_since) >= SWITCH_THRESHOLD:
                         displayed_emotion = None
 
-            # speaking switching (debounced/hysteresis via audio callback flags)
+            # speaking state switching
             if speaking != speaking_state:
                 if speaking_since is None:
                     speaking_since = now
@@ -385,58 +479,70 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
             else:
                 speaking_since = None
 
-            # broadcast state for Blender (and any client)
-            state = {
-                'timestamp': time.time(),
-                'emotion': displayed_emotion or 'neutral',
-                'speaking': bool(speaking_state),
-                'confidence': float(match_score or 0.0),
-                'head_rotation': head_rot,
-                'pupil': pupil,
-                'volume': float(volume_level)
-            }
-            broadcast_state(state)
+            if results.multi_face_landmarks:
+                lm = results.multi_face_landmarks[0].landmark
+                pts3 = get_landmark_array(lm)
 
-            # overlay debug info
+                # compute features
+                head_rot = compute_head_rotation(pts3)
+                pupil = compute_pupil_normalized(pts3)
+                eye_open = compute_eye_openness(pts3)
+                brow_val = compute_brow_value(pts3)
+
+                # pack state
+                state = {
+                    "head_rotation": head_rot,
+                    "pupil": pupil,
+                    "eye_open": eye_open,
+                    "brows": brow_val,
+                    "volume": volume_level,
+                    "emotion": displayed_emotion or "neutral",
+                    "speaking": speaking,
+                    "confidence": 1.0  # or some classifier confidence
+                }
+
+                # send to Blender
+                broadcast_state(state)
+
+            # show preview if not streaming
             if not DATA_STREAMING_MODE:
+                cv2.imshow("PNG Tuber", frame)
+                if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
+                    break
+            # --- Rendering ---
+            if DATA_STREAMING_MODE:
+                # Just webcam
+                cv2.imshow("Data Streaming Webcam", frame)
+            else:
+                # Debug overlay
                 y = 20
-                cv2.putText(frame, f"Templates: {', '.join(templates.keys()) or 'none'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200),1); y+=22
-                cv2.putText(frame, f"REC: {'ON' if recording else 'OFF'} (press 'r')", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0) if recording else (0,180,255),2); y+=26
-                if match_name:
-                    cv2.putText(frame, f"Instant match -> {match_name} mae={match_mae:.4f} score={(match_score*100) if match_score is not None else 0:.0f}%", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2); y+=26
-                else:
-                    cv2.putText(frame, "Instant match -> none", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,180,255),2); y+=26
-                cv2.putText(frame, f"Displayed emotion: {displayed_emotion or 'none'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2); y+=26
-                cv2.putText(frame, f"Speaking: {'YES' if speaking_state else 'no'}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255) if speaking_state else (180,180,180),2); y+=26
-                cv2.putText(frame, f"Head yaw/pitch/roll: {head_rot['yaw']:.1f}/{head_rot['pitch']:.1f}/{head_rot['roll']:.1f}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2); y+=26
-                cv2.putText(frame, f"Pupil x/y: {pupil['x']:.3f}/{pupil['y']:.3f}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2); y+=22
-                cv2.putText(frame, f"Volume: {volume_level:.6f}", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2); y+=22
-                if recording:
-                    cv2.putText(frame, f"Recording samples: {len(record_samples)} (press 'r')", (10,y), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
-                cv2.imshow('Template Recorder Matcher (Smoothed)', frame)
+                cv2.putText(frame, f"Templates: {', '.join(templates.keys()) or 'none'}", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                y += 22
 
-            # PNG tuber window (resize to fit window)
-            if not DATA_STREAMING_MODE:
-                tuber_frame = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH,4), dtype=np.uint8)
-                tuber_frame[:,:] = GREEN_KEY
+                # PNG tuber render
+                tuber_frame = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
+                tuber_frame[:, :] = GREEN_KEY
                 emotion = displayed_emotion or 'neutral'
                 state_tex = 'speaking' if speaking_state and emotion in loaded_textures and 'speaking' in loaded_textures[emotion] else 'main'
                 texture = loaded_textures.get(emotion, {}).get(state_tex)
                 if texture is not None:
                     th, tw = texture.shape[:2]
                     scale = min(WINDOW_WIDTH / tw, WINDOW_HEIGHT / th)
-                    new_w, new_h = max(1, int(tw*scale)), max(1,int(th*scale))
+                    new_w, new_h = max(1, int(tw * scale)), max(1, int(th * scale))
                     resized = cv2.resize(texture, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    x = (WINDOW_WIDTH - new_w)//2
-                    y = (WINDOW_HEIGHT - new_h)//2
-                    y1, y2 = y, y+new_h
-                    x1, x2 = x, x+new_w
-                    alpha_s = resized[:,:,3:4]/255.0
+                    x = (WINDOW_WIDTH - new_w) // 2
+                    y = (WINDOW_HEIGHT - new_h) // 2
+                    y1, y2 = y, y + new_h
+                    x1, x2 = x, x + new_w
+                    alpha_s = resized[:, :, 3:4] / 255.0
                     alpha_l = 1.0 - alpha_s
-                    tuber_frame[y1:y2, x1:x2, :3] = (alpha_s * resized[:,:,:3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3])
+                    tuber_frame[y1:y2, x1:x2, :3] = (
+                        alpha_s * resized[:, :, :3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3]
+                    )
                 cv2.imshow('PNG Tuber', tuber_frame)
 
-            # keyboard handling
+            # key handling
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
@@ -476,8 +582,6 @@ with mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection
                                 save_template(name, record_samples, tol)
                                 templates = load_templates()
                     record_samples = []
-            #if key == ord('l'):
-#                reload_settings_and_textures()
 
             # interval recording
             if recording and live_vector is not None:
