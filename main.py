@@ -9,7 +9,6 @@ import threading
 import math
 
 
-
 # ----------------- config / defaults -----------------
 TEMPLATES_DIR = "templates"
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
