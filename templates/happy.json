@@ -112089,6 +112089,6 @@
     ]
   ],
   "landmark_count": 478,
-  "tolerance": 0.1,
+  "tolerance": 0.001,
   "timestamp": 1762369731.9044766
 }

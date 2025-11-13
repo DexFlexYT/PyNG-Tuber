@@ -10,7 +10,7 @@ import math
 
 
 # ----------------- config / defaults -----------------
-TEMPLATES_DIR = "templates"
+TEMPLATES_DIR = r"D:\code\python\PyNG-Tuber\templates"
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
 
