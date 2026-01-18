@@ -3,6 +3,8 @@ import mediapipe as mp
 import numpy as np
 import json
 import math
+import os
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import sounddevice as sd
@@ -27,22 +29,34 @@ NOSE_IDX = 1
 CHIN_IDX = 152
 
 # ---------------- BLENDING SETTINGS ----------------
-NEUTRAL_LERP_FACTOR = 0.005      # How fast neutral pose adapts
-BROW_NEUTRAL_BLEND = 0.005       # How fast brow neutral adapts
-BROWS_LERP = 0.2                 # Brow movement smoothing
+NEUTRAL_LERP_FACTOR = 0.02
+BROW_NEUTRAL_BLEND = 0.005
+BROWS_LERP = 0.2
+
+# ---------------- EMOTION RECOGNITION SETTINGS ----------------
+TEMPLATES_DIR = r"D:\code\python\PyNG-Tuber\templates"
+DEFAULT_TOLERANCE = 0.06
+SWITCH_THRESHOLD = 0.005
+INSTANT_CONFIDENCE = 0.85
 
 # Neutral pose tracking
 neutral_pose = {'pitch': 0.0, 'yaw': 0.0, 'roll': 25.0}
 brow_neutral = None
 
-# Global face data (streams BOTH corrected AND raw data)
+# Emotion state tracking
+templates = {}
+displayed_emotion = None
+candidate_name = None
+candidate_since = None
+
+# Global face data
 face_data = {
-    "head_rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},     # CORRECTED for body
-    "head_rotation_raw": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}, # RAW for pupils
+    "head_rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+    "head_rotation_raw": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
     "pupil": {"x": 0.0, "y": 0.0},
     "eye_open": 1.0,
     "mouth_open": 0.0,
-    "brows": 0.0,         # Already neutral-corrected delta
+    "brows": 0.0,
     "volume": 0.0,
     "emotion": "neutral",
     "speaking": False,
@@ -179,6 +193,157 @@ def apply_neutral_correction(raw_head_rot):
     }
     return corrected
 
+# ---------------- EMOTION RECOGNITION FUNCTIONS ----------------
+
+def euler_to_matrix_3d(p_rad, y_rad, r_rad):
+    cp, sp = math.cos(p_rad), math.sin(p_rad)
+    cy, sy = math.cos(y_rad), math.sin(y_rad)
+    cr, sr = math.cos(r_rad), math.sin(r_rad)
+
+    Rx = np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])
+    Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
+    Rz = np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
+
+    R = Rz @ Ry @ Rx
+    return R
+
+def invert_rotation_and_apply(points, pitch, yaw, roll):
+    """Apply inverse rotation to counteract head rotation"""
+    p_rad = math.radians(-pitch)
+    y_rad = math.radians(-yaw)
+    r_rad = math.radians(-roll)
+    R_inv = euler_to_matrix_3d(p_rad, y_rad, r_rad)
+    
+    center = points.mean(axis=0)
+    pts_centered = points - center
+    pts_rotated = (R_inv @ pts_centered.T).T
+    pts_corrected = pts_rotated + center
+    return pts_corrected
+
+def normalize_landmarks_no_rotate(pts):
+    """Normalize landmarks for emotion matching"""
+    if pts.shape[0] == 0:
+        return None
+    center = pts.mean(axis=0)
+    pts_c = pts - center
+    if pts.shape[0] > max(LEFT_EYE_IDX, RIGHT_EYE_IDX):
+        left = pts[LEFT_EYE_IDX][:2]
+        right = pts[RIGHT_EYE_IDX][:2]
+        iod = np.linalg.norm(right - left)
+    else:
+        iod = np.max(np.linalg.norm(pts_c[:, :2], axis=1))
+    if iod <= 1e-6:
+        iod = 1.0
+    pts_n = pts_c[:, :2] / iod
+    return pts_n.flatten().tolist()
+
+def orthogonal_procrustes_mae(X, Y):
+    """Calculate mean absolute error after procrustes alignment"""
+    if X.size == 0 or Y.size == 0:
+        return float('inf')
+    n = min(X.shape[0], Y.shape[0])
+    if n == 0:
+        return float('inf')
+    Xa = X[:n].copy()
+    Ya = Y[:n].copy()
+    A = Xa.T @ Ya
+    try:
+        U, _, Vt = np.linalg.svd(A)
+        R = U @ Vt
+    except:
+        R = np.eye(2, dtype=np.float32)
+    Xr = Xa @ R
+    return float(np.mean(np.abs(Xr - Ya)))
+
+def load_templates():
+    """Load emotion templates from JSON files"""
+    templates = {}
+    if not os.path.exists(TEMPLATES_DIR):
+        print(f"[WARNING] Templates directory not found: {TEMPLATES_DIR}")
+        return templates
+    
+    for fn in os.listdir(TEMPLATES_DIR):
+        if fn.lower().endswith('.json'):
+            path = os.path.join(TEMPLATES_DIR, fn)
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                samples = [np.array(s, dtype=np.float32) for s in data.get('samples', [])]
+                templates[data['name']] = {
+                    "samples": samples,
+                    "landmark_count": int(data.get('landmark_count', 0)),
+                    "tolerance": float(data.get('tolerance', DEFAULT_TOLERANCE)),
+                    "path": path
+                }
+            except Exception as e:
+                print(f'[ERROR] Failed to load template {path}: {e}')
+    return templates
+
+def match_emotion(pts3, head_rot):
+    """Match current face landmarks to emotion templates"""
+    global templates
+    
+    if not templates:
+        return None, None, None
+    
+    # Apply inverse rotation to normalize head pose
+    pts3_corrected = invert_rotation_and_apply(
+        pts3,
+        head_rot['pitch'],
+        head_rot['yaw'],
+        head_rot['roll']
+    )
+    
+    # Normalize landmarks
+    vec = normalize_landmarks_no_rotate(pts3_corrected)
+    if vec is None:
+        return None, None, None
+    
+    live_vector = np.array(vec, dtype=np.float32)
+    live_pts = live_vector.reshape(-1, 2)
+    
+    # Find best matching template
+    best = None
+    for tname, t in templates.items():
+        for samp in t['samples']:
+            samp_pts = samp.reshape(-1, 2)
+            mae = orthogonal_procrustes_mae(live_pts, samp_pts)
+            if best is None or mae < best[1]:
+                best = (tname, mae, t.get('tolerance', DEFAULT_TOLERANCE))
+    
+    if best is not None:
+        bname, bmae, btol = best
+        score = max(0.0, 1.0 - (bmae / btol)) if btol > 0 else 0.0
+        return bname, bmae, score
+    
+    return None, None, None
+
+def update_emotion_state(match_name, match_score):
+    """Update emotion state with hysteresis"""
+    global displayed_emotion, candidate_name, candidate_since
+    
+    now = time.monotonic()
+    
+    if match_name != candidate_name:
+        candidate_name = match_name
+        candidate_since = now
+    else:
+        if candidate_name is not None:
+            # Instant switch if high confidence
+            if match_score is not None and match_score >= INSTANT_CONFIDENCE:
+                if displayed_emotion != candidate_name:
+                    displayed_emotion = candidate_name
+                    candidate_since = now
+            # Gradual switch with threshold
+            elif displayed_emotion != candidate_name and (now - candidate_since) >= SWITCH_THRESHOLD:
+                displayed_emotion = candidate_name
+        else:
+            # Return to neutral
+            if displayed_emotion is not None and (now - candidate_since) >= SWITCH_THRESHOLD:
+                displayed_emotion = None
+
+# ---------------- AUDIO CALLBACK ----------------
+
 def audio_callback(indata, frames, time_, status):
     global volume_level, speaking
     volume_norm = float(np.linalg.norm(indata) / frames)
@@ -190,7 +355,8 @@ def audio_callback(indata, frames, time_, status):
         if volume_norm > VOLUME_THRESHOLD_START:
             speaking = True
 
-# HTTP Server Handler
+# ---------------- HTTP SERVER ----------------
+
 class FaceTrackingHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     
@@ -210,15 +376,24 @@ def run_http_server():
     server = HTTPServer(("127.0.0.1", 80), FaceTrackingHandler)
     print("HTTP server started on http://127.0.0.1:80")
     print("Neutral pose auto-calibration enabled!")
+    print("Emotion recognition enabled!")
     print("Streaming BOTH corrected + raw head rotation!")
     server.serve_forever()
 
+# ---------------- MAIN LOOP ----------------
+
 def main():
-    global face_data
+    global face_data, templates, displayed_emotion
     
+    # Load templates
+    templates = load_templates()
+    print(f"Loaded {len(templates)} emotion templates: {list(templates.keys())}")
+    
+    # Start HTTP server
     server_thread = threading.Thread(target=run_http_server, daemon=True)
     server_thread.start()
     
+    # Start audio stream
     stream = sd.InputStream(callback=audio_callback)
     stream.start()
     
@@ -251,20 +426,29 @@ def main():
                 mouth_open = compute_mouth_openness(pts3)
                 brows_raw = compute_brow_value(pts3)
                 
+                # Emotion recognition
+                match_name, match_mae, match_score = match_emotion(pts3, raw_head_rot)
+                update_emotion_state(match_name, match_score)
+                
                 # Apply neutral pose correction (for body rigging)
                 corrected_head_rot = apply_neutral_correction(raw_head_rot)
                 
-                # Update face_data with BOTH values
-                face_data["head_rotation"] = corrected_head_rot      # Body rigging (corrected)
-                face_data["head_rotation_raw"] = raw_head_rot        # Pupils (raw, no drift)
+                # Update face_data
+                face_data["head_rotation"] = corrected_head_rot
+                face_data["head_rotation_raw"] = raw_head_rot
                 face_data["pupil"] = pupil_pos
                 face_data["eye_open"] = eye_open
                 face_data["mouth_open"] = mouth_open
                 face_data["brows"] = brows_raw
                 face_data["volume"] = volume_level
                 face_data["speaking"] = speaking
-                face_data["emotion"] = "neutral"
-                face_data["confidence"] = 1.0
+                face_data["emotion"] = displayed_emotion or "neutral"
+                face_data["confidence"] = match_score if match_score is not None else 1.0
+            
+            # Display current emotion on frame
+            emotion_text = f"Emotion: {displayed_emotion or 'neutral'}"
+            cv2.putText(frame, emotion_text, (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             cv2.imshow('Face Tracking', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
