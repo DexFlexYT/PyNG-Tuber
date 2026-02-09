@@ -32,6 +32,17 @@ CHIN_IDX = 152
 NEUTRAL_LERP_FACTOR = 0.02
 BROW_NEUTRAL_BLEND = 0.005
 BROWS_LERP = 0.2
+POSITION_LERP = 0.5
+face_scale_neutral = None
+FACE_SCALE_LERP = 0.00
+DEBUG_MODE = False
+
+# ---------------- ONE EURO FILTER SETTINGS ----------------
+# Lower min_cutoff = smoother but more lag.
+# Higher beta = more responsive to fast motion.
+ROT_FILT_MIN_CUTOFF = 1.0
+ROT_FILT_BETA = 0.007
+ROT_FILT_D_CUTOFF = 1.0
 
 # ---------------- EMOTION RECOGNITION SETTINGS ----------------
 TEMPLATES_DIR = r"D:\code\python\PyNG-Tuber\templates"
@@ -42,25 +53,75 @@ INSTANT_CONFIDENCE = 0.85
 # Neutral pose tracking
 neutral_pose = {'pitch': 0.0, 'yaw': 0.0, 'roll': 25.0}
 brow_neutral = None
+brow_neutral_left = None
+brow_neutral_right = None
+
+eye_open_l_prev = 1.0
+eye_open_r_prev = 1.0
+EYE_LERP = 1
 
 # Emotion state tracking
 templates = {}
 displayed_emotion = None
 candidate_name = None
 candidate_since = None
+last_frame_ts = None
+
+class OneEuroFilter:
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = None
+        self.dx_prev = 0.0
+
+    def _alpha(self, cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+    def filter(self, x, dt):
+        if self.x_prev is None:
+            self.x_prev = float(x)
+            self.dx_prev = 0.0
+            return float(x)
+
+        dx = (x - self.x_prev) / max(dt, 1e-6)
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = self.dx_prev + a_d * (dx - self.dx_prev)
+
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff, dt)
+        x_hat = self.x_prev + a * (x - self.x_prev)
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return float(x_hat)
+
+rot_filters = {
+    "pitch": OneEuroFilter(ROT_FILT_MIN_CUTOFF, ROT_FILT_BETA, ROT_FILT_D_CUTOFF),
+    "yaw": OneEuroFilter(ROT_FILT_MIN_CUTOFF, ROT_FILT_BETA, ROT_FILT_D_CUTOFF),
+    "roll": OneEuroFilter(ROT_FILT_MIN_CUTOFF, ROT_FILT_BETA, ROT_FILT_D_CUTOFF),
+}
 
 # Global face data
 face_data = {
     "head_rotation": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
     "head_rotation_raw": {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+    "head_position": {"x": 0.0, "y": 0.0, "z": 0.0},
     "pupil": {"x": 0.0, "y": 0.0},
     "eye_open": 1.0,
+    "eye_open_left": 1.0,
+    "eye_open_right": 1.0,
     "mouth_open": 0.0,
     "brows": 0.0,
+    "brows_left": 0.0,
+    "brows_right": 0.0,
     "volume": 0.0,
     "emotion": "neutral",
     "speaking": False,
-    "confidence": 1.0
+    "confidence": 1.0,
+    "emote_index": -1
+
 }
 
 # Audio globals
@@ -72,6 +133,14 @@ VOLUME_THRESHOLD_STOP = 2e-6
 def lerp(a, b, f):
     """Linear interpolation"""
     return a + (b - a) * f
+
+def smooth_position(prev, cur, f):
+    return {
+        "x": lerp(prev["x"], cur["x"], f),
+        "y": lerp(prev["y"], cur["y"], f),
+        "z": lerp(prev["z"], cur["z"], f),
+    }
+
 
 def get_landmark_array(landmarks):
     return np.array([[lm.x, lm.y, lm.z if hasattr(lm, 'z') else 0.0] for lm in landmarks], dtype=np.float32)
@@ -93,6 +162,49 @@ def compute_head_rotation(pts3):
     pitch = math.degrees(math.asin(max(-1.0, min(1.0, -normal[1]))))
     yaw = math.degrees(math.asin(max(-1.0, min(1.0, normal[0]))))
     return {'pitch': float(pitch), 'yaw': float(yaw), 'roll': float(roll)}
+
+def compute_head_position(pts3, head_rot):
+    """
+    Screen-space X/Y from centroid.
+    Z estimated from face scale (eye distance) after rotation normalization.
+    """
+
+    global face_scale_neutral
+
+    # ---- X / Y (screen space) ----
+    center = pts3.mean(axis=0)
+    x = (center[0] - 0.5) * 2.0
+    y = (0.5 - center[1]) * 2.0
+
+    # ---- Z (distance from camera via face scale) ----
+    # Undo head rotation so turning doesn't affect size
+    pts_unrot = invert_rotation_and_apply(
+        pts3,
+        head_rot['pitch'],
+        head_rot['yaw'],
+        head_rot['roll']
+    )
+
+    left_eye = pts_unrot[LEFT_EYE_IDX][:2]
+    right_eye = pts_unrot[RIGHT_EYE_IDX][:2]
+
+    eye_dist = np.linalg.norm(right_eye - left_eye)
+
+    # Initialize neutral face scale
+    if face_scale_neutral is None:
+        face_scale_neutral = eye_dist
+
+    # Slowly adapt neutral (handles posture drift)
+    face_scale_neutral = lerp(face_scale_neutral, eye_dist, FACE_SCALE_LERP)
+
+    # Relative depth: closer = positive Z
+    z = (eye_dist - face_scale_neutral) / (face_scale_neutral + 1e-8)
+
+    return {
+        "x": float(x),
+        "y": float(y),
+        "z": float(z)
+    }
 
 def compute_pupil_normalized(pts3):
     try:
@@ -127,9 +239,9 @@ def compute_eye_openness(pts3):
     except Exception:
         return 1.0
 
-    left_vert = abs(lu[1] - ll[1])
+    left_vert = np.linalg.norm(lu - ll)
     left_w = np.linalg.norm(left_outer - left_inner)
-    right_vert = abs(ru[1] - rl[1])
+    right_vert = np.linalg.norm(ru - rl)
     right_w = np.linalg.norm(right_inner - right_outer)
 
     left_norm = left_vert / (left_w + 1e-8)
@@ -139,6 +251,49 @@ def compute_eye_openness(pts3):
     MAX_OV = 0.08
     t = (val - MIN_OV) / (MAX_OV - MIN_OV)
     return max(0.0, min(1.0, t))
+
+def eye_angle(upper, lower, inner, outer):
+    lid_vec = upper - lower
+    eye_vec = outer - inner
+    lid_vec /= np.linalg.norm(lid_vec) + 1e-8
+    eye_vec /= np.linalg.norm(eye_vec) + 1e-8
+    # Perpendicular component magnitude
+    return abs(np.cross(eye_vec, lid_vec))
+
+
+def compute_eye_openness_split(pts3):
+    global eye_open_l_prev, eye_open_r_prev
+
+    try:
+        lu = pts3[LEFT_EYE_UPPER][:2]
+        ll = pts3[LEFT_EYE_LOWER][:2]
+        ru = pts3[RIGHT_EYE_UPPER][:2]
+        rl = pts3[RIGHT_EYE_LOWER][:2]
+
+        lo = pts3[LEFT_EYE_CORNERS[0]][:2]
+        li = pts3[LEFT_EYE_CORNERS[1]][:2]
+        ri = pts3[RIGHT_EYE_CORNERS[0]][:2]
+        ro = pts3[RIGHT_EYE_CORNERS[1]][:2]
+    except Exception:
+        return 1.0, 1.0
+
+    left_raw = eye_angle(lu, ll, li, lo)
+    right_raw = eye_angle(ru, rl, ri, ro)
+
+    # Empirical MediaPipe ranges
+    MIN_A = 0.0   # closed
+    MAX_A = 1.0   # wide open
+
+    left_val = (left_raw - MIN_A) / (MAX_A - MIN_A)
+    right_val = (right_raw - MIN_A) / (MAX_A - MIN_A)
+
+    left_val = max(0.0, min(1.0, float(left_val)))
+    right_val = max(0.0, min(1.0, float(right_val)))
+
+    eye_open_l_prev = lerp(eye_open_l_prev, left_val, EYE_LERP)
+    eye_open_r_prev = lerp(eye_open_r_prev, right_val, EYE_LERP)
+
+    return eye_open_l_prev, eye_open_r_prev
 
 def compute_brow_value(pts3):
     global brow_neutral
@@ -163,6 +318,42 @@ def compute_brow_value(pts3):
         return float(delta)
     except Exception:
         return 0.0
+
+def compute_brow_value_split(pts3):
+    global brow_neutral_left, brow_neutral_right
+    try:
+        left_eye_mid = (pts3[LEFT_EYE_CORNERS[0]] + pts3[LEFT_EYE_CORNERS[1]]) / 2.0
+        right_eye_mid = (pts3[RIGHT_EYE_CORNERS[0]] + pts3[RIGHT_EYE_CORNERS[1]]) / 2.0
+
+        left_brow_mid = np.mean(pts3[LEFT_BROW], axis=0)
+        right_brow_mid = np.mean(pts3[RIGHT_BROW], axis=0)
+
+        left_dist = left_brow_mid[1] - left_eye_mid[1]
+        right_dist = right_brow_mid[1] - right_eye_mid[1]
+
+        left_w = np.linalg.norm(pts3[LEFT_EYE_CORNERS[0]][:2] - pts3[LEFT_EYE_CORNERS[1]][:2])
+        right_w = np.linalg.norm(pts3[RIGHT_EYE_CORNERS[0]][:2] - pts3[RIGHT_EYE_CORNERS[1]][:2])
+
+        left_norm = left_dist / (left_w + 1e-8)
+        right_norm = right_dist / (right_w + 1e-8)
+
+        if brow_neutral_left is None:
+            brow_neutral_left = left_norm
+        if brow_neutral_right is None:
+            brow_neutral_right = right_norm
+
+        brow_neutral_left = lerp(brow_neutral_left, left_norm, BROW_NEUTRAL_BLEND)
+        brow_neutral_right = lerp(brow_neutral_right, right_norm, BROW_NEUTRAL_BLEND)
+
+        left_delta = left_norm - brow_neutral_left
+        right_delta = right_norm - brow_neutral_right
+
+        return float(left_delta), float(right_delta)
+
+    except Exception:
+        return 0.0, 0.0
+
+
 
 def compute_mouth_openness(pts3):
     MOUTH_TOP = 13
@@ -191,7 +382,9 @@ def apply_neutral_correction(raw_head_rot):
         'yaw': raw_head_rot['yaw'] - neutral_pose['yaw'],
         'roll': raw_head_rot['roll'] - neutral_pose['roll']
     }
+    
     return corrected
+
 
 # ---------------- EMOTION RECOGNITION FUNCTIONS ----------------
 
@@ -359,10 +552,10 @@ def audio_callback(indata, frames, time_, status):
 
 class FaceTrackingHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    
+
     def log_message(self, format, *args):
         pass
-    
+
     def do_GET(self):
         body = json.dumps(face_data).encode()
         self.send_response(200)
@@ -371,6 +564,28 @@ class FaceTrackingHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/emote":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+
+        try:
+            data = json.loads(raw.decode())
+            emote = int(data.get("emote_index", -1))
+            face_data["emote_index"] = emote
+            face_data["emote_timestamp"] = time.monotonic()
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.end_headers()
 
 def run_http_server():
     server = HTTPServer(("127.0.0.1", 80), FaceTrackingHandler)
@@ -383,7 +598,7 @@ def run_http_server():
 # ---------------- MAIN LOOP ----------------
 
 def main():
-    global face_data, templates, displayed_emotion
+    global face_data, templates, displayed_emotion, last_frame_ts
     
     # Load templates
     templates = load_templates()
@@ -419,13 +634,47 @@ def main():
                 landmarks = results.multi_face_landmarks[0].landmark
                 pts3 = get_landmark_array(landmarks)
                 
-                # Raw computations
+
+                now_ts = time.monotonic()
+                if last_frame_ts is None:
+                    dt = 1.0 / 20.0
+                else:
+                    dt = now_ts - last_frame_ts
+                last_frame_ts = now_ts
+
+                # Raw computations FIRST
                 raw_head_rot = compute_head_rotation(pts3)
+                # One Euro filter for stability
+                raw_head_rot = {
+                    "pitch": rot_filters["pitch"].filter(raw_head_rot["pitch"], dt),
+                    "yaw": rot_filters["yaw"].filter(raw_head_rot["yaw"], dt),
+                    "roll": rot_filters["roll"].filter(raw_head_rot["roll"], dt),
+                }
+
+                pts3_unrot = invert_rotation_and_apply(
+                pts3,
+                raw_head_rot['pitch'],
+                raw_head_rot['yaw'],
+                raw_head_rot['roll']
+            )
+
+                         
                 pupil_pos = compute_pupil_normalized(pts3)
-                eye_open = compute_eye_openness(pts3)
-                mouth_open = compute_mouth_openness(pts3)
-                brows_raw = compute_brow_value(pts3)
-                
+                eye_open = compute_eye_openness(pts3_unrot)
+                eye_open_left, eye_open_right = compute_eye_openness_split(pts3_unrot)
+                mouth_open = compute_mouth_openness(pts3_unrot)
+                brows_left, brows_right = compute_brow_value_split(pts3_unrot)
+                brows_raw = (brows_left + brows_right) * 0.5
+
+                                
+                # Head position needs raw rotation
+                head_pos_raw = compute_head_position(pts3, raw_head_rot)
+                face_data["head_position"] = smooth_position(
+                    face_data["head_position"],
+                    head_pos_raw,
+                    POSITION_LERP
+                )
+
                 # Emotion recognition
                 match_name, match_mae, match_score = match_emotion(pts3, raw_head_rot)
                 update_emotion_state(match_name, match_score)
@@ -438,17 +687,38 @@ def main():
                 face_data["head_rotation_raw"] = raw_head_rot
                 face_data["pupil"] = pupil_pos
                 face_data["eye_open"] = eye_open
+                face_data["eye_open_left"] = eye_open_left
+                face_data["eye_open_right"] = eye_open_right
                 face_data["mouth_open"] = mouth_open
                 face_data["brows"] = brows_raw
+                face_data["brows_left"] = brows_left
+                face_data["brows_right"] = brows_right
                 face_data["volume"] = volume_level
                 face_data["speaking"] = speaking
                 face_data["emotion"] = displayed_emotion or "neutral"
                 face_data["confidence"] = match_score if match_score is not None else 1.0
             
-            # Display current emotion on frame
-            emotion_text = f"Emotion: {displayed_emotion or 'neutral'}"
-            cv2.putText(frame, emotion_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if DEBUG_MODE:
+                # Display values on frame
+                overlay_lines = [
+                    f"Emotion: {displayed_emotion or 'neutral'}",
+                    f"Head Rot (corr) P/Y/R: {face_data['head_rotation']['pitch']:.2f} {face_data['head_rotation']['yaw']:.2f} {face_data['head_rotation']['roll']:.2f}",
+                    f"Head Rot (raw)  P/Y/R: {face_data['head_rotation_raw']['pitch']:.2f} {face_data['head_rotation_raw']['yaw']:.2f} {face_data['head_rotation_raw']['roll']:.2f}",
+                    f"Head Pos X/Y/Z: {face_data['head_position']['x']:.3f} {face_data['head_position']['y']:.3f} {face_data['head_position']['z']:.3f}",
+                    f"Pupil X/Y: {face_data['pupil']['x']:.3f} {face_data['pupil']['y']:.3f}",
+                    f"Eye Open (avg): {face_data['eye_open']:.3f}",
+                    f"Eye Open L/R: {face_data['eye_open_left']:.3f} {face_data['eye_open_right']:.3f}",
+                    f"Mouth Open: {face_data['mouth_open']:.3f}",
+                    f"Brows (avg): {face_data['brows']:.3f}",
+                    f"Brows L/R: {face_data['brows_left']:.3f} {face_data['brows_right']:.3f}",
+                    f"Volume: {face_data['volume']:.6f} Speaking: {face_data['speaking']}",
+                    f"Confidence: {face_data['confidence']:.3f}"
+                ]
+                y = 30
+                for line in overlay_lines:
+                    cv2.putText(frame, line, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    y += 18
             
             cv2.imshow('Face Tracking', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):

@@ -1,0 +1,6 @@
+mediapipe
+tensorflow==2.13.1
+protobuf==3.20.3
+opencv-python
+numpy
+sounddevice
