@@ -9,10 +9,10 @@ import threading
 import math
 
 
-
 # ----------------- config / defaults -----------------
-TEMPLATES_DIR = "templates"
+TEMPLATES_DIR = r"D:\code\python\PyNG-Tuber\templates"
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
 
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
@@ -21,6 +21,7 @@ mp_drawing = mp.solutions.drawing_utils
 # iris indices according to MediaPipe Face Mesh
 LEFT_IRIS = [469, 470, 471, 472, 473]
 RIGHT_IRIS = [474, 475, 476, 477, 478]
+
 
 # eye corner indices for normalization (left / right)
 LEFT_EYE_CORNERS = (33, 133)   # left eye: outer, inner
@@ -38,6 +39,20 @@ RIGHT_BROW = [336, 296, 334] # right inner/mid/out brow
 
 NOSE_IDX = 1
 CHIN_IDX = 152  # approximate chin tip in MediaPipe Face Mesh
+
+
+MOUTH_OUTER = [
+    61, 146, 91, 181, 84, 17, 314, 405,
+    321, 375, 291, 308, 324, 318, 402,
+    317, 14, 87, 178, 88, 95, 78
+]
+
+# Inner mouth contour (the opening — upper + lower inner lip)
+MOUTH_INNER = [
+    191, 80, 81, 82, 13, 312, 311,
+    310, 415, 308
+]
+
 
 tneutral_brow = None
 
@@ -75,7 +90,6 @@ server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server_socket.bind((STREAM_HOST, STREAM_PORT))
 server_socket.listen(1)
 
-
 def accept_clients_loop():
     while True:
         try:
@@ -86,7 +100,6 @@ def accept_clients_loop():
         except Exception as e:
             print(f"[stream] accept failed: {e}")
             break
-
 
 def client_monitor(conn, addr):
     try:
@@ -99,9 +112,7 @@ def client_monitor(conn, addr):
         conn.close()
         print(f"[stream] client disconnected: {addr}")
 
-
 threading.Thread(target=accept_clients_loop, daemon=True).start()
-
 
 def broadcast_state(state_dict):
     data = (json.dumps(state_dict) + "\n").encode('utf-8')
@@ -117,7 +128,6 @@ def broadcast_state(state_dict):
 # ----------------- audio (volume + VAD with hysteresis) -----------------
 volume_level = 0.0
 speaking = False
-
 
 def audio_callback(indata, frames, time_, status):
     global volume_level, speaking
@@ -171,11 +181,8 @@ def compute_brow_value(pts3):
     except Exception:
         return 0.0
 
-
 def compute_eye_openness(pts3):
-    """Return a normalized eye openness value in [0,1].
-    We compute normalized vertical separation between upper and lower eyelid and divide by eye width (to be scale invariant).
-    """
+    """Return a normalized eye openness value in [0,1]."""
     try:
         lu = pts3[LEFT_EYE_UPPER][:2]
         ll = pts3[LEFT_EYE_LOWER][:2]
@@ -192,31 +199,21 @@ def compute_eye_openness(pts3):
     left_vert = abs(lu[1] - ll[1])
     left_w = np.linalg.norm(left_outer - left_inner)
     right_vert = abs(ru[1] - rl[1])
-    right_w = np.linalg.norm(right_outer - right_inner)
+    right_w = np.linalg.norm(right_inner - right_outer)
 
-    # avoid divide by zero
     left_norm = left_vert / (left_w + 1e-8)
     right_norm = right_vert / (right_w + 1e-8)
 
-
     val = float((left_norm + right_norm) / 2.0)
 
-    # normalization: you may want to tune these values depending on camera distance / model
-    # here we assume typical open eye value ~0.03..0.08; map that to [0,1]
     MIN_OV = 0.012
     MAX_OV = 0.08
     t = (val - MIN_OV) / (MAX_OV - MIN_OV)
     t = max(0.0, min(1.0, t))
     return t
 
-
 def compute_pupil_normalized(pts3):
-    """
-    Compute normalized pupil offset in face-local coordinates using iris centers and eye corners.
-    Returns dictionary with x,y in approximately [-1,1] where 0 is center.
-    """
     try:
-        # get iris centers (x,y)
         left_iris = np.mean(pts3[LEFT_IRIS][:, :2], axis=0)
         right_iris = np.mean(pts3[RIGHT_IRIS][:, :2], axis=0)
         left_outer, left_inner = pts3[LEFT_EYE_CORNERS[0]][:2], pts3[LEFT_EYE_CORNERS[1]][:2]
@@ -224,7 +221,6 @@ def compute_pupil_normalized(pts3):
     except Exception:
         return {"x":0.0, "y":0.0}
 
-    # normalize each eye independently: compute vector from eye center to iris, divided by eye width
     left_eye_center = (left_outer + left_inner) / 2.0
     left_eye_width = np.linalg.norm(left_outer - left_inner)
     left_offset = (left_iris - left_eye_center) / (left_eye_width + 1e-8)
@@ -233,18 +229,14 @@ def compute_pupil_normalized(pts3):
     right_eye_width = np.linalg.norm(right_outer - right_inner)
     right_offset = (right_iris - right_eye_center) / (right_eye_width + 1e-8)
 
-    # average both eyes for smoothing
     avg_offset = (left_offset + right_offset) / 2.0
 
-    # flip Y if needed (mediapipe's y grows downward in image space but we are using normalized face coords)
     return {"x": float(avg_offset[0]), "y": float(avg_offset[1])}
-
 
 def load_image_force(path):
     img = Image.open(path)
     img.load()
     return cv2.cvtColor(np.array(img.convert('RGBA').copy()), cv2.COLOR_RGBA2BGRA)
-
 
 def load_textures():
     loaded = {}
@@ -257,7 +249,6 @@ def load_textures():
                 except Exception as ex:
                     print(f"[load_textures] failed to read {p}: {ex}")
     return loaded
-
 
 def load_settings(cfg_path='settings.json'):
     global SWITCH_THRESHOLD, SPEAK_SWITCH_THRESHOLD, VOLUME_THRESHOLD_START, VOLUME_THRESHOLD_STOP, INSTANT_CONFIDENCE, DATA_STREAMING_MODE
@@ -284,7 +275,6 @@ def save_template(name, samples, tolerance=DEFAULT_TOLERANCE):
         json.dump(data, f, indent=2)
     print(f"[saved] template '{name}' -> {path}")
 
-
 def load_templates():
     templates = {}
     for fn in os.listdir(TEMPLATES_DIR):
@@ -299,10 +289,8 @@ def load_templates():
                 print('Failed to load template', path, e)
     return templates
 
-
 def get_landmark_array(landmarks):
     return np.array([[lm.x, lm.y, lm.z if hasattr(lm, 'z') else 0.0] for lm in landmarks], dtype=np.float32)
-
 
 def normalize_landmarks_no_rotate(pts):
     if pts.shape[0] == 0:
@@ -319,7 +307,6 @@ def normalize_landmarks_no_rotate(pts):
         iod = 1.0
     pts_n = pts_c[:, :2] / iod
     return pts_n.flatten().tolist()
-
 
 def orthogonal_procrustes_mae(X, Y):
     if X.size == 0 or Y.size == 0: return float('inf')
@@ -361,6 +348,35 @@ def compute_head_rotation(pts3):
 
     return {'pitch': float(pitch), 'yaw': float(yaw), 'roll': float(roll)}
 
+# --------------- new: inverse rotation counteracting head rotate -------------------
+def euler_to_matrix_3d(p_rad, y_rad, r_rad):
+    cp, sp = math.cos(p_rad), math.sin(p_rad)
+    cy, sy = math.cos(y_rad), math.sin(y_rad)
+    cr, sr = math.cos(r_rad), math.sin(r_rad)
+
+    Rx = np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])
+    Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
+    Rz = np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
+
+    R = Rz @ Ry @ Rx
+    return R
+
+def invert_rotation_and_apply(points, pitch, yaw, roll):
+    # points: Nx3 numpy array
+    # Rotation to counteract (negative angles)
+    p_rad = math.radians(-pitch)
+    y_rad = math.radians(-yaw)
+    r_rad = math.radians(-roll)
+    R_inv = euler_to_matrix_3d(p_rad, y_rad, r_rad)  # inverse rotation matrix
+
+    # Center point as mean of points
+    center = points.mean(axis=0)
+
+    # Translate points to origin, rotate, then translate back
+    pts_centered = points - center
+    pts_rotated = (R_inv @ pts_centered.T).T
+    pts_corrected = pts_rotated + center
+    return pts_corrected
 # ----------------- startup loads -----------------
 loaded_textures = load_textures()
 load_settings()
@@ -386,8 +402,6 @@ candidate_since = None
 displayed_emotion = None
 speaking_state = False
 speaking_since = None
-
-
 
 # ----------------- main loop -----------------
 with mp_face_mesh.FaceMesh(
@@ -418,7 +432,20 @@ with mp_face_mesh.FaceMesh(
                 lm = results.multi_face_landmarks[0].landmark
                 pts3 = get_landmark_array(lm)
 
-                # pupil / iris tracking
+
+                # compute head rotation first
+                head_rot = compute_head_rotation(pts3)  # Use raw landmarks to get actual face rotation
+
+                # apply inverse rotation to counteract head rotation on pts3
+                pts3 = invert_rotation_and_apply(
+                    pts3,
+                    head_rot['pitch'],
+                    head_rot['yaw'],
+                    head_rot['roll']
+                )
+
+                # now perform pupil / iris tracking and feature extraction on corrected landmarks
+
                 pupil = compute_pupil_normalized(pts3)
 
                 vec = normalize_landmarks_no_rotate(pts3)
@@ -439,17 +466,15 @@ with mp_face_mesh.FaceMesh(
                         score = max(0.0, 1.0 - (bmae / btol)) if btol > 0 else 0.0
                         match_name, match_mae, match_score = bname, bmae, score
 
-                # compute head rotation
-                head_rot = compute_head_rotation(pts3)
 
                 if not DATA_STREAMING_MODE:
-                    mp_drawing.draw_landmarks(
-                        frame,
-                        results.multi_face_landmarks[0],
-                        mp_face_mesh.FACEMESH_TESSELATION,
-                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1, circle_radius=1),
-                        mp_drawing.DrawingSpec(color=(0, 128, 255), thickness=1)
-                    )
+                    for face_landmarks in results.multi_face_landmarks:
+                        mouth_indices = MOUTH_OUTER + MOUTH_INNER
+                        for idx in mouth_indices:
+                            x = int(face_landmarks.landmark[idx].x * frame.shape[1])
+                            y = int(face_landmarks.landmark[idx].y * frame.shape[0])
+                            cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)  # small green dots
+
 
             now = time.monotonic()
 
@@ -479,15 +504,53 @@ with mp_face_mesh.FaceMesh(
             else:
                 speaking_since = None
 
+            mouth_data = None
             if results.multi_face_landmarks:
                 lm = results.multi_face_landmarks[0].landmark
                 pts3 = get_landmark_array(lm)
 
-                # compute features
+                # compute head rotation for mouth payload (using raw pts again to represent actual head rotation)
                 head_rot = compute_head_rotation(pts3)
+
+                # apply inverse rotation on pts3 for mouth landmarks stability
+                pts3 = invert_rotation_and_apply(
+                    pts3,
+                    head_rot['pitch'],
+                    head_rot['yaw'],
+                    head_rot['roll']
+                )
+
                 pupil = compute_pupil_normalized(pts3)
                 eye_open = compute_eye_openness(pts3)
                 brow_val = compute_brow_value(pts3)
+
+                # --- new: compute face bbox (normalized image coords) ---
+                xs = pts3[:,0]
+                ys = pts3[:,1]
+                minx, maxx = float(xs.min()), float(xs.max())
+                miny, maxy = float(ys.min()), float(ys.max())
+
+                # --- new: gather mouth landmarks (image-normalized coords) ---
+                mouth_idxs = MOUTH_OUTER + MOUTH_INNER
+                mouth_landmarks = []
+                for idx in mouth_idxs:
+                    if idx < len(pts3):
+                        x = float(pts3[idx][0])
+                        y = float(pts3[idx][1])
+                        mouth_landmarks.append({"i": int(idx), "x": x, "y": y})
+                outer_lm = []
+                inner_lm = []
+                for idx in MOUTH_OUTER:
+                    if idx < len(pts3):
+                        outer_lm.append({"i": int(idx), "x": float(pts3[idx][0]), "y": float(pts3[idx][1])})
+                for idx in MOUTH_INNER:
+                    if idx < len(pts3):
+                        inner_lm.append({"i": int(idx), "x": float(pts3[idx][0]), "y": float(pts3[idx][1])})
+                mouth_data = {
+                    "bbox": [minx, miny, maxx, maxy],
+                    "outer": outer_lm,
+                    "inner": inner_lm
+                }
 
                 # pack state
                 state = {
@@ -498,7 +561,8 @@ with mp_face_mesh.FaceMesh(
                     "volume": volume_level,
                     "emotion": displayed_emotion or "neutral",
                     "speaking": speaking,
-                    "confidence": 1.0  # or some classifier confidence
+                    "confidence": 1.0,
+                    "mouth": mouth_data  # <-- new: mouth payload
                 }
 
                 # send to Blender
@@ -509,40 +573,37 @@ with mp_face_mesh.FaceMesh(
                 cv2.imshow("PNG Tuber", frame)
                 if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
                     break
-            # --- Rendering ---
+            # --- Rendering --- (unchanged)
             if DATA_STREAMING_MODE:
-                # Just webcam
                 cv2.imshow("Data Streaming Webcam", frame)
             else:
-                # Debug overlay
                 y = 20
                 cv2.putText(frame, f"Templates: {', '.join(templates.keys()) or 'none'}", (10, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                 y += 22
 
-                # PNG tuber render
-                tuber_frame = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
-                tuber_frame[:, :] = GREEN_KEY
-                emotion = displayed_emotion or 'neutral'
-                state_tex = 'speaking' if speaking_state and emotion in loaded_textures and 'speaking' in loaded_textures[emotion] else 'main'
-                texture = loaded_textures.get(emotion, {}).get(state_tex)
-                if texture is not None:
-                    th, tw = texture.shape[:2]
-                    scale = min(WINDOW_WIDTH / tw, WINDOW_HEIGHT / th)
-                    new_w, new_h = max(1, int(tw * scale)), max(1, int(th * scale))
-                    resized = cv2.resize(texture, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    x = (WINDOW_WIDTH - new_w) // 2
-                    y = (WINDOW_HEIGHT - new_h) // 2
-                    y1, y2 = y, y + new_h
-                    x1, x2 = x, x + new_w
-                    alpha_s = resized[:, :, 3:4] / 255.0
-                    alpha_l = 1.0 - alpha_s
-                    tuber_frame[y1:y2, x1:x2, :3] = (
-                        alpha_s * resized[:, :, :3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3]
-                    )
-                cv2.imshow('PNG Tuber', tuber_frame)
+                #tuber_frame = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
+                #tuber_frame[:, :] = GREEN_KEY
+                #emotion = displayed_emotion or 'neutral'
+                #state_tex = 'speaking' if speaking_state and emotion in loaded_textures and 'speaking' in loaded_textures[emotion] else 'main'
+                #texture = loaded_textures.get(emotion, {}).get(state_tex)
+                #if texture is not None:
+                #    th, tw = texture.shape[:2]
+                #    scale = min(WINDOW_WIDTH / tw, WINDOW_HEIGHT / th)
+                #    new_w, new_h = max(1, int(tw * scale)), max(1, int(th * scale))
+                #    resized = cv2.resize(texture, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                #    x = (WINDOW_WIDTH - new_w) // 2
+                #    y = (WINDOW_HEIGHT - new_h) // 2
+                #    y1, y2 = y, y + new_h
+                #    x1, x2 = x, x + new_w
+                #    alpha_s = resized[:, :, 3:4] / 255.0
+                #    alpha_l = 1.0 - alpha_s
+                #    tuber_frame[y1:y2, x1:x2, :3] = (
+                #        alpha_s * resized[:, :, :3] + alpha_l * tuber_frame[y1:y2, x1:x2, :3]
+                #    )
+                #cv2.imshow('PNG Tuber', tuber_frame)
 
-            # key handling
+            # key handling (unchanged)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
@@ -572,7 +633,7 @@ with mp_face_mesh.FaceMesh(
                                 tol = DEFAULT_TOLERANCE
                             path = os.path.join(TEMPLATES_DIR, f"{name}.json")
                             if os.path.exists(path):
-                                overwrite = input(f"Template '{name}' exists. Overwrite? (y/N):").strip().lower()
+                                overwrite = input(f"Template '{name}' exists. Overwrite? (y/N): ").strip().lower()
                                 if overwrite != 'y':
                                     print('Aborted save.')
                                 else:
@@ -583,11 +644,8 @@ with mp_face_mesh.FaceMesh(
                                 templates = load_templates()
                     record_samples = []
 
-            # interval recording
-            if recording and live_vector is not None:
-                if (now - last_record_time) >= record_interval:
-                    record_samples.append(live_vector.tolist())
-                    last_record_time = now
+    except Exception as e:
+        print("[error]", e)
 
     finally:
         cap.release()
